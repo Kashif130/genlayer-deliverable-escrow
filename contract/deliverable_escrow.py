@@ -40,7 +40,6 @@ of a deterministic condition.
 
 from genlayer import *
 from dataclasses import dataclass
-import json
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +69,7 @@ class Escrow:
     submit_count: u256          # how many times the payee has submitted
     refund_enabled: bool        # whether the payer may reclaim funds if never approved
     created_at: u256
+    last_raw_response: str      # debug: last raw validator output before parsing
 
 
 class DeliverableEscrow(gl.Contract):
@@ -136,6 +136,7 @@ class DeliverableEscrow(gl.Contract):
             submit_count=u256(0),
             refund_enabled=refund_enabled,
             created_at=u256(0),
+            last_raw_response="",
         )
         self.escrows[eid] = e
 
@@ -202,11 +203,11 @@ class DeliverableEscrow(gl.Contract):
                 f"Brief (what was requested): {brief}\n\n"
                 f"Acceptance criteria: {criteria}\n\n"
                 f"Submission (payee's proof of work): {submission}\n\n"
-                "Judge the submission against the brief and criteria. "
-                "Respond ONLY with JSON in this exact shape, nothing else:\n"
-                '{"verdict": "APPROVED" | "REJECTED" | "NEEDS_REVISION", '
-                '"reasoning": "<one or two sentences citing the specific '
-                'criteria that were or were not met>"}'
+                "Judge the submission against the brief and criteria.\n\n"
+                "Respond in exactly two lines, nothing else:\n"
+                "Line 1: one word — APPROVED, REJECTED, or NEEDS_REVISION\n"
+                "Line 2: one short sentence explaining why, citing the "
+                "specific criteria that were or were not met"
             )
             return gl.nondet.exec_prompt(prompt)
 
@@ -222,19 +223,32 @@ class DeliverableEscrow(gl.Contract):
             ),
         )
 
-        try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.strip("`")
-                if cleaned.lower().startswith("json"):
-                    cleaned = cleaned[4:]
-                cleaned = cleaned.strip()
-            parsed = json.loads(cleaned)
-            verdict = str(parsed.get("verdict", "")).strip().upper()
-            reasoning = str(parsed.get("reasoning", "")).strip()
-        except Exception:
+        e.last_raw_response = raw[:800]
+
+        # Keyword-based extraction instead of strict JSON parsing: this
+        # pinned GenVM/model combination does not reliably return
+        # structured JSON even when explicitly instructed to, so we parse
+        # defensively by scanning for the verdict keyword instead of
+        # depending on an exact machine-readable shape.
+        upper = raw.upper()
+        if "NEEDS_REVISION" in upper or "NEEDS REVISION" in upper:
             verdict = "NEEDS_REVISION"
-            reasoning = "Validator response was not valid JSON; defaulted to NEEDS_REVISION for safety."
+        elif "APPROVED" in upper:
+            verdict = "APPROVED"
+        elif "REJECTED" in upper:
+            verdict = "REJECTED"
+        else:
+            verdict = "NEEDS_REVISION"
+
+        # Reasoning: everything after the first line (the verdict word),
+        # falling back to the full raw response if there's no second line.
+        lines = raw.strip().splitlines()
+        if len(lines) > 1:
+            reasoning = " ".join(line.strip() for line in lines[1:] if line.strip())
+        else:
+            reasoning = raw.strip()
+        if not reasoning:
+            reasoning = "No reasoning text returned by validator."
 
         if verdict not in ("APPROVED", "REJECTED", "NEEDS_REVISION"):
             verdict = "NEEDS_REVISION"
@@ -340,6 +354,15 @@ class DeliverableEscrow(gl.Contract):
         if e is None:
             raise Exception("unknown escrow_id")
         return str(e.payee)
+
+    @gl.public.view
+    def get_last_raw_response(self, escrow_id: int) -> str:
+        """Debug helper: the raw (unparsed) validator output from the last
+        verify_deliverable call, so a mis-parse can be diagnosed."""
+        e = self.escrows.get(u256(escrow_id), None)
+        if e is None:
+            raise Exception("unknown escrow_id")
+        return e.last_raw_response
 
     @gl.public.view
     def escrow_count(self) -> int:
