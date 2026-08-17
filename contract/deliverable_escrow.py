@@ -40,6 +40,7 @@ of a deterministic condition.
 
 from genlayer import *
 from dataclasses import dataclass
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +261,23 @@ class DeliverableEscrow(gl.Contract):
                 f"Submission (payee's own description, unverified): {submission}\n\n"
                 f"{artifact_block}\n\n"
                 "Judge the submission against the brief and criteria.\n\n"
-                "Respond in EXACTLY this format, nothing else, no extra "
-                "words on line 1:\n"
+                "Respond in ONE of these two exact formats, nothing else:\n\n"
+                "Format A (preferred):\n"
+                'A single JSON object with BOTH fields present and non-empty: '
+                '{"verdict": "APPROVED|REJECTED|NEEDS_REVISION", "reasoning": '
+                '"<one short sentence citing the specific criteria that were '
+                'or were not met>"}\n\n'
+                "Format B:\n"
                 "VERDICT: <APPROVED|REJECTED|NEEDS_REVISION>\n"
                 "REASON: <one short sentence citing the specific criteria "
-                "that were or were not met>"
+                "that were or were not met>\n\n"
+                "Use exactly one of these two formats — do not mix them, "
+                "and do not add any text before or after.\n\n"
+                "The reasoning/REASON field is REQUIRED and must never be "
+                "omitted, left blank, or replaced with just the verdict "
+                "word again — even when the verdict feels obvious, state "
+                "the concrete reason (what specific criterion was or "
+                "wasn't met, citing the fetched content or its absence)."
             )
             return gl.nondet.exec_prompt(prompt)
 
@@ -282,40 +295,78 @@ class DeliverableEscrow(gl.Contract):
 
         e.last_raw_response = raw[:800]
 
-        # Strict structured parsing: only the labeled VERDICT field on the
-        # first non-empty line is authoritative. We do NOT scan the whole
-        # response for a keyword — a REJECTED verdict whose reasoning text
-        # contains the word "approved" (e.g. "not approved") must never be
-        # misread as APPROVED. If the first line isn't an exact, well-formed
-        # verdict token, we fail closed to NEEDS_REVISION rather than guess.
-        lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+        # Structured parsing with two accepted shapes, tried in order:
+        #   1) JSON: {"verdict": "...", "reasoning": "..."}
+        #   2) Plain: "VERDICT: ...\nREASON: ..."
+        # In both cases the verdict is matched EXACTLY against
+        # VALID_VERDICTS — never a substring/containment scan — so a
+        # REJECTED verdict whose reasoning text happens to contain the
+        # word "approved" (e.g. "not approved") can never be misread as
+        # APPROVED. If neither shape parses into a valid verdict token, we
+        # fail closed to NEEDS_REVISION rather than guess.
         verdict = "NEEDS_REVISION"
         reasoning = ""
+        parsed_ok = False
 
-        if lines:
-            first = lines[0]
-            token = first
-            if ":" in first:
-                token = first.split(":", 1)[1]
-            token = token.strip().strip('"').strip("'").upper()
-            # Exact match only — no substring containment check.
-            if token in VALID_VERDICTS:
-                verdict = token
-            # else: malformed first line -> fail closed to NEEDS_REVISION
+        # --- Attempt 1: JSON shape ---
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+        try:
+            parsed = json.loads(cleaned)
+            candidate = str(parsed.get("verdict", "")).strip().upper()
+            if candidate in VALID_VERDICTS:
+                verdict = candidate
+                reasoning = str(parsed.get("reasoning", "")).strip()
+                parsed_ok = True
+        except Exception:
+            pass
 
-            if len(lines) > 1:
-                reason_line = lines[1]
-                if ":" in reason_line:
-                    reasoning = reason_line.split(":", 1)[1].strip()
-                else:
-                    reasoning = reason_line
-            elif verdict not in VALID_VERDICTS or token not in VALID_VERDICTS:
-                # Malformed output entirely — keep raw for debugging via
-                # get_last_raw_response(), but don't try to guess reasoning.
-                reasoning = "Validator response did not match the required format."
+        # --- Attempt 2: plain "VERDICT: X" / "REASON: ..." lines ---
+        if not parsed_ok:
+            lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+            if lines:
+                first = lines[0]
+                token = first.split(":", 1)[1] if ":" in first else first
+                token = token.strip().strip('"').strip("'").upper()
+                if token in VALID_VERDICTS:
+                    verdict = token
+                    parsed_ok = True
+                    if len(lines) > 1:
+                        reason_line = lines[1]
+                        reasoning = (
+                            reason_line.split(":", 1)[1].strip()
+                            if ":" in reason_line
+                            else reason_line
+                        )
 
-        if not reasoning:
-            reasoning = "No reasoning text returned by validator."
+        if not parsed_ok:
+            # Neither shape yielded a recognized verdict token — fail
+            # closed rather than guess. Keep raw for debugging via
+            # get_last_raw_response().
+            verdict = "NEEDS_REVISION"
+            reasoning = "Validator response did not match the required format."
+        elif not reasoning:
+            # Verdict token was valid but the model omitted the reasoning
+            # field despite the prompt requiring it. An APPROVED (or any)
+            # verdict with zero stated justification is exactly the kind
+            # of unverified trust this contract exists to avoid — an
+            # unjustified verdict must not be able to release funds any
+            # more than an unfetched deliverable could. So we fail closed
+            # here too: downgrade to NEEDS_REVISION regardless of what the
+            # model claimed, rather than accept a bare word as sufficient
+            # grounds to move money. The raw output stays available via
+            # get_last_raw_response() for debugging and manual re-review.
+            verdict = "NEEDS_REVISION"
+            reasoning = (
+                "Validator returned a verdict token with no reasoning "
+                "text, which is not sufficient grounds to approve or "
+                "reject; treated as NEEDS_REVISION. See "
+                "get_last_raw_response() for the full output."
+            )
 
         e.verdict_reasoning = reasoning[:500]
         if verdict == "APPROVED":
