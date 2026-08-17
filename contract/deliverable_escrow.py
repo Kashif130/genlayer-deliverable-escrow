@@ -63,7 +63,8 @@ class Escrow:
     amount: u256
     brief: str                # what the deliverable should be
     criteria: str              # how validators should judge it
-    submission: str             # payee's proof-of-work text/URL, empty until submitted
+    submission: str             # payee's proof-of-work description, empty until submitted
+    deliverable_url: str         # optional URL to the actual artifact validators must fetch
     status: u256
     verdict_reasoning: str
     submit_count: u256          # how many times the payee has submitted
@@ -75,6 +76,7 @@ class Escrow:
 class DeliverableEscrow(gl.Contract):
     escrows: TreeMap[u256, Escrow]
     next_id: u256
+    _require_deliverable_url: TreeMap[u256, bool]
 
     def __init__(self):
         self.next_id = u256(0)
@@ -89,6 +91,7 @@ class DeliverableEscrow(gl.Contract):
         brief: str,
         criteria: str,
         refund_enabled: bool,
+        require_deliverable_url: bool = True,
     ) -> None:
         """
         Deposit funds into a new escrow.
@@ -109,6 +112,12 @@ class DeliverableEscrow(gl.Contract):
                            APPROVED verdict + withdraw() — useful when the
                            payee wants a stronger guarantee they'll be
                            paid once they deliver acceptable work.
+        require_deliverable_url: if True (default), submit_deliverable()
+                           requires a fetchable URL to the actual artifact,
+                           so validators judge the real deliverable rather
+                           than only the payee's description of it. Set to
+                           False only for briefs with no fetchable artifact
+                           (e.g. purely off-chain or in-person work).
         """
         if gl.message.value <= 0:
             raise Exception("escrow must be funded with a positive amount")
@@ -131,6 +140,7 @@ class DeliverableEscrow(gl.Contract):
             brief=brief,
             criteria=criteria,
             submission="",
+            deliverable_url="",
             status=u256(STATUS_FUNDED),
             verdict_reasoning="",
             submit_count=u256(0),
@@ -139,15 +149,21 @@ class DeliverableEscrow(gl.Contract):
             last_raw_response="",
         )
         self.escrows[eid] = e
+        self._require_deliverable_url[eid] = require_deliverable_url
 
     # -----------------------------------------------------------------
     # 2. Payee submits proof of work
     # -----------------------------------------------------------------
     @gl.public.write
-    def submit_deliverable(self, escrow_id: int, submission: str) -> None:
+    def submit_deliverable(
+        self, escrow_id: int, submission: str, deliverable_url: str = ""
+    ) -> None:
         """
-        Payee submits their proof of work: a description, and/or a URL
-        pointing at the actual deliverable, for validators to review.
+        Payee submits their proof of work: a description, plus (unless the
+        escrow was created with require_deliverable_url=False) a URL
+        pointing at the actual deliverable that validators will fetch and
+        judge directly — the description alone is never sufficient to
+        approve, since it is payee-authored and unverified.
         Callable again after a REJECTED verdict to resubmit revised work.
         """
         eid = u256(escrow_id)
@@ -161,7 +177,16 @@ class DeliverableEscrow(gl.Contract):
         if len(submission.strip()) == 0:
             raise Exception("submission cannot be empty")
 
+        needs_url = self._require_deliverable_url.get(eid, True)
+        if needs_url and len(deliverable_url.strip()) == 0:
+            raise Exception(
+                "this escrow requires a deliverable_url pointing at the "
+                "actual artifact; validators will not judge on the "
+                "description alone"
+            )
+
         e.submission = submission
+        e.deliverable_url = deliverable_url.strip()
         e.status = u256(STATUS_SUBMITTED)
         e.submit_count = u256(int(e.submit_count) + 1)
         self.escrows[eid] = e
@@ -192,22 +217,54 @@ class DeliverableEscrow(gl.Contract):
         brief = e.brief
         criteria = e.criteria
         submission = e.submission
+        deliverable_url = e.deliverable_url
+
+        VALID_VERDICTS = ("APPROVED", "REJECTED", "NEEDS_REVISION")
 
         def get_verdict() -> str:
             # Non-deterministic block. Closure-captured values only, no
             # external args, must return a plain string.
+            #
+            # Fetch the actual artifact here, inside the nondet flow, so
+            # each validator judges the real deliverable rather than only
+            # trusting the payee's own description of it. If there's no
+            # URL (require_deliverable_url was disabled at creation) we
+            # fall back to judging the description alone, explicitly
+            # flagged as such in the prompt.
+            if deliverable_url:
+                try:
+                    artifact = gl.nondet.web.render(deliverable_url, mode="text")
+                except Exception as fetch_err:
+                    artifact = f"[FETCH FAILED: {fetch_err}]"
+                artifact_block = (
+                    f"Fetched deliverable content from {deliverable_url}:\n"
+                    f"---\n{artifact}\n---\n\n"
+                    "Base your verdict on this fetched content, not on the "
+                    "payee's description below. If the fetch failed or the "
+                    "content is empty/inaccessible, that alone is grounds "
+                    "for REJECTED or NEEDS_REVISION — never APPROVED."
+                )
+            else:
+                artifact_block = (
+                    "No deliverable URL was provided for this escrow; you "
+                    "only have the payee's description to go on. Treat an "
+                    "unverifiable claim with appropriate skepticism."
+                )
+
             prompt = (
                 "You are a neutral reviewer judging whether a submitted "
                 "deliverable satisfies an agreed brief, for an on-chain "
                 "escrow release decision.\n\n"
                 f"Brief (what was requested): {brief}\n\n"
                 f"Acceptance criteria: {criteria}\n\n"
-                f"Submission (payee's proof of work): {submission}\n\n"
+                f"Submission (payee's own description, unverified): {submission}\n\n"
+                f"{artifact_block}\n\n"
                 "Judge the submission against the brief and criteria.\n\n"
-                "Respond in exactly two lines, nothing else:\n"
-                "Line 1: one word — APPROVED, REJECTED, or NEEDS_REVISION\n"
-                "Line 2: one short sentence explaining why, citing the "
-                "specific criteria that were or were not met"
+                "Respond in EXACTLY this format, nothing else, no extra "
+                "words on line 1:\n"
+                "VERDICT: <APPROVED|REJECTED|NEEDS_REVISION>\n"
+                "REASON: <one short sentence citing the specific criteria "
+                "that were or were not met>"
             )
             return gl.nondet.exec_prompt(prompt)
 
@@ -225,33 +282,40 @@ class DeliverableEscrow(gl.Contract):
 
         e.last_raw_response = raw[:800]
 
-        # Keyword-based extraction instead of strict JSON parsing: this
-        # pinned GenVM/model combination does not reliably return
-        # structured JSON even when explicitly instructed to, so we parse
-        # defensively by scanning for the verdict keyword instead of
-        # depending on an exact machine-readable shape.
-        upper = raw.upper()
-        if "NEEDS_REVISION" in upper or "NEEDS REVISION" in upper:
-            verdict = "NEEDS_REVISION"
-        elif "APPROVED" in upper:
-            verdict = "APPROVED"
-        elif "REJECTED" in upper:
-            verdict = "REJECTED"
-        else:
-            verdict = "NEEDS_REVISION"
+        # Strict structured parsing: only the labeled VERDICT field on the
+        # first non-empty line is authoritative. We do NOT scan the whole
+        # response for a keyword — a REJECTED verdict whose reasoning text
+        # contains the word "approved" (e.g. "not approved") must never be
+        # misread as APPROVED. If the first line isn't an exact, well-formed
+        # verdict token, we fail closed to NEEDS_REVISION rather than guess.
+        lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+        verdict = "NEEDS_REVISION"
+        reasoning = ""
 
-        # Reasoning: everything after the first line (the verdict word),
-        # falling back to the full raw response if there's no second line.
-        lines = raw.strip().splitlines()
-        if len(lines) > 1:
-            reasoning = " ".join(line.strip() for line in lines[1:] if line.strip())
-        else:
-            reasoning = raw.strip()
+        if lines:
+            first = lines[0]
+            token = first
+            if ":" in first:
+                token = first.split(":", 1)[1]
+            token = token.strip().strip('"').strip("'").upper()
+            # Exact match only — no substring containment check.
+            if token in VALID_VERDICTS:
+                verdict = token
+            # else: malformed first line -> fail closed to NEEDS_REVISION
+
+            if len(lines) > 1:
+                reason_line = lines[1]
+                if ":" in reason_line:
+                    reasoning = reason_line.split(":", 1)[1].strip()
+                else:
+                    reasoning = reason_line
+            elif verdict not in VALID_VERDICTS or token not in VALID_VERDICTS:
+                # Malformed output entirely — keep raw for debugging via
+                # get_last_raw_response(), but don't try to guess reasoning.
+                reasoning = "Validator response did not match the required format."
+
         if not reasoning:
             reasoning = "No reasoning text returned by validator."
-
-        if verdict not in ("APPROVED", "REJECTED", "NEEDS_REVISION"):
-            verdict = "NEEDS_REVISION"
 
         e.verdict_reasoning = reasoning[:500]
         if verdict == "APPROVED":
